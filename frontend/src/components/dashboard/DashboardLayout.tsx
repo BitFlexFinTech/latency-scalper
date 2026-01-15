@@ -95,34 +95,6 @@ export function DashboardLayout() {
 
   // CRITICAL FIX: All status data now comes from useSystemStatus hook (reads from store)
   // No need for separate API calls or state management
-        setVpsIp(vps.ip || '107.191.61.107');
-      }
-    };
-
-    fetchAllStatus();
-    const interval = setInterval(fetchAllStatus, 10000); // Poll every 10 seconds
-
-    return () => {
-      clearInterval(interval);
-    };
-  }, [vps.ip]);
-
-  // SSOT FIX: Check backend API health separately
-  useEffect(() => {
-    const checkApi = async () => {
-      try {
-        await checkApiHealth();
-        setApiOnline(true);
-      } catch (error) {
-        console.error('[DashboardLayout] Backend API health check failed:', error);
-        setApiOnline(false);
-      }
-    };
-
-    checkApi();
-    const interval = setInterval(checkApi, 5000); // Check every 5 seconds
-    return () => clearInterval(interval);
-  }, []);
 
   const renderTabContent = () => {
     switch (activeTab) {
