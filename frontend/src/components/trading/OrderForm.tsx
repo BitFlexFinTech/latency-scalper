@@ -1,0 +1,337 @@
+import { useState, useEffect, useMemo } from 'react';
+import { ShoppingCart, TrendingUp, TrendingDown, Loader2, AlertTriangle } from 'lucide-react';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import { supabase } from '@/integrations/supabase/client';
+import { useAppStore } from '@/store/useAppStore';
+import { RiskManager } from '@/lib/riskManager';
+import { OrderManager } from '@/lib/orderManager';
+import { toast } from 'sonner';
+import { ActionButton } from '@/components/ui/ActionButton';
+import { BUTTON_TOOLTIPS } from '@/config/buttonTooltips';
+
+const POPULAR_PAIRS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT'];
+
+interface ExchangeBalance {
+  exchange_name: string;
+  balance_usdt: number | null;
+}
+
+export function OrderForm() {
+  const vpsStatus = useAppStore(state => state.vpsStatus);
+  const [exchanges, setExchanges] = useState<string[]>([]);
+  const [exchangeBalances, setExchangeBalances] = useState<Record<string, number>>({});
+  const [exchange, setExchange] = useState('');
+  const [symbol, setSymbol] = useState('BTC/USDT');
+  const [side, setSide] = useState<'buy' | 'sell'>('buy');
+  const [orderType, setOrderType] = useState<'market' | 'limit'>('market');
+  const [amount, setAmount] = useState('');
+  const [price, setPrice] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [riskWarnings, setRiskWarnings] = useState<string[]>([]);
+  const [riskError, setRiskError] = useState<string | null>(null);
+
+  // Check if VPS is available for live trading (required for HFT)
+  const isVpsOnline = Object.values(vpsStatus).some(v => v.status === 'healthy' && v.publicIp);
+  const vpsRequiredForLive = !isVpsOnline;
+
+  // Get available balance for selected exchange
+  const availableBalance = useMemo(() => {
+    if (!exchange) return 0;
+    return exchangeBalances[exchange] || 0;
+  }, [exchange, exchangeBalances]);
+
+  // SSOT FIX: Fetch connected exchanges with balances from backend API
+  useEffect(() => {
+    const fetchExchanges = async () => {
+      try {
+        // Use backend API as Single Source of Truth
+        const { getSystemStatus } = await import('@/services/systemStatusApi');
+        const systemStatus = await getSystemStatus();
+        
+        const connectedExchanges = systemStatus.exchanges.list || [];
+        
+        if (connectedExchanges.length > 0) {
+          const names = connectedExchanges.map(e => e.name);
+          setExchanges(names);
+          setExchange(names[0]);
+
+          // Live mode: use real exchange balances from backend API (REAL DATA)
+          const balances: Record<string, number> = {};
+          connectedExchanges.forEach(exchange => {
+            balances[exchange.name] = exchange.balance || 0;
+          });
+          setExchangeBalances(balances);
+        }
+      } catch (error) {
+        console.error('[OrderForm] Error fetching exchanges from backend API:', error);
+        setExchanges([]);
+        setExchangeBalances({});
+      }
+    };
+    fetchExchanges();
+
+    // SSOT FIX: Poll backend API instead of Supabase realtime (backend API is SSOT)
+    // Poll every 10 seconds to get updates from backend API
+    const pollInterval = setInterval(() => {
+      fetchExchanges();
+    }, 10000);
+
+    return () => {
+      clearInterval(pollInterval);
+    };
+  }, []);
+
+  // Validate risk on amount/price change
+  useEffect(() => {
+    const validateRisk = async () => {
+      if (!amount || !exchange) {
+        setRiskWarnings([]);
+        setRiskError(null);
+        return;
+      }
+
+      const riskManager = RiskManager.getInstance();
+      const result = await riskManager.validateOrder(
+        exchange,
+        symbol,
+        side,
+        parseFloat(amount),
+        price ? parseFloat(price) : undefined
+      );
+
+      if (!result.allowed) {
+        setRiskError(result.reason || 'Order blocked by risk limits');
+        setRiskWarnings([]);
+      } else {
+        setRiskError(null);
+        setRiskWarnings(result.warnings || []);
+      }
+    };
+
+    const timeout = setTimeout(validateRisk, 300);
+    return () => clearTimeout(timeout);
+  }, [amount, price, exchange, symbol, side]);
+
+  const handlePercentage = (percent: number) => {
+    if (availableBalance <= 0) {
+      toast.error('No balance available on this exchange');
+      return;
+    }
+    const calculatedAmount = (availableBalance * percent / 100).toFixed(2);
+    setAmount(calculatedAmount);
+  };
+
+  const handleSubmit = async () => {
+    if (!exchange || !symbol || !amount) {
+      toast.error('Please fill in all required fields');
+      return;
+    }
+
+    if (riskError) {
+      toast.error(riskError);
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      await OrderManager.getInstance().placeOrder({
+        exchangeName: exchange,
+        symbol,
+        side,
+        type: orderType,
+        amount: parseFloat(amount),
+        price: price ? parseFloat(price) : undefined
+      });
+      toast.success(`${side.toUpperCase()} order placed for ${amount} ${symbol}`);
+
+      // Reset form
+      setAmount('');
+      setPrice('');
+    } catch (error: any) {
+      toast.error(error.message || 'Failed to place order');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <Card className="glass-card">
+      <CardHeader className="pb-3">
+        <CardTitle className="text-base flex items-center gap-2">
+          <ShoppingCart className="w-4 h-4 text-primary" />
+          Place Order
+          <span className="text-xs bg-destructive/20 text-destructive px-2 py-0.5 rounded">LIVE</span>
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {/* Exchange Selector */}
+        <div className="space-y-1.5">
+          <Label className="text-xs">Exchange</Label>
+          <Select value={exchange} onValueChange={setExchange}>
+            <SelectTrigger className="h-9">
+              <SelectValue placeholder="Select exchange" />
+            </SelectTrigger>
+            <SelectContent>
+              {exchanges.map(ex => (
+                <SelectItem key={ex} value={ex}>{ex}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+
+        {/* Symbol Input */}
+        <div className="space-y-1.5">
+          <Label className="text-xs">Symbol</Label>
+          <Select value={symbol} onValueChange={setSymbol}>
+            <SelectTrigger className="h-9">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {POPULAR_PAIRS.map(pair => (
+                <SelectItem key={pair} value={pair}>{pair}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+
+        {/* Side Toggle */}
+        <div className="space-y-1.5">
+          <Label className="text-xs">Side</Label>
+          <ToggleGroup 
+            type="single" 
+            value={side} 
+            onValueChange={(v) => v && setSide(v as 'buy' | 'sell')}
+            className="w-full"
+          >
+            <ToggleGroupItem 
+              value="buy" 
+              className="flex-1 data-[state=on]:bg-success/20 data-[state=on]:text-success data-[state=on]:border-success/50"
+            >
+              <TrendingUp className="w-4 h-4 mr-1" />
+              Buy
+            </ToggleGroupItem>
+            <ToggleGroupItem 
+              value="sell" 
+              className="flex-1 data-[state=on]:bg-destructive/20 data-[state=on]:text-destructive data-[state=on]:border-destructive/50"
+            >
+              <TrendingDown className="w-4 h-4 mr-1" />
+              Sell
+            </ToggleGroupItem>
+          </ToggleGroup>
+        </div>
+
+        {/* Order Type */}
+        <div className="space-y-1.5">
+          <Label className="text-xs">Type</Label>
+          <ToggleGroup 
+            type="single" 
+            value={orderType} 
+            onValueChange={(v) => v && setOrderType(v as 'market' | 'limit')}
+            className="w-full"
+          >
+            <ToggleGroupItem value="market" className="flex-1">Market</ToggleGroupItem>
+            <ToggleGroupItem value="limit" className="flex-1">Limit</ToggleGroupItem>
+          </ToggleGroup>
+        </div>
+
+        {/* Amount Input */}
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between">
+            <Label className="text-xs">Amount (USDT)</Label>
+            <span className="text-xs text-muted-foreground">
+              Available: ${availableBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            </span>
+          </div>
+          <Input
+            type="number"
+            value={amount}
+            onChange={(e) => setAmount(e.target.value)}
+            placeholder="0.00"
+            className="h-9"
+          />
+          <div className="flex gap-1">
+            {[25, 50, 75, 100].map(pct => (
+              <ActionButton
+                key={pct}
+                tooltip={BUTTON_TOOLTIPS[`amount${pct}` as keyof typeof BUTTON_TOOLTIPS]}
+                variant="outline"
+                size="sm"
+                className="flex-1 h-7 text-xs"
+                onClick={() => handlePercentage(pct)}
+                disabled={availableBalance <= 0}
+              >
+                {pct}%
+              </ActionButton>
+            ))}
+          </div>
+        </div>
+
+        {/* Price Input (for limit orders) */}
+        {orderType === 'limit' && (
+          <div className="space-y-1.5">
+            <Label className="text-xs">Price</Label>
+            <Input
+              type="number"
+              value={price}
+              onChange={(e) => setPrice(e.target.value)}
+              placeholder="0.00"
+              className="h-9"
+            />
+          </div>
+        )}
+
+        {/* Risk Warnings */}
+        {riskWarnings.length > 0 && (
+          <Alert className="border-warning/50 bg-warning/10">
+            <AlertTriangle className="h-4 w-4 text-warning" />
+            <AlertDescription className="text-xs text-warning">
+              {riskWarnings.join('. ')}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {/* Risk Error */}
+        {riskError && (
+          <Alert className="border-destructive/50 bg-destructive/10">
+            <AlertTriangle className="h-4 w-4 text-destructive" />
+            <AlertDescription className="text-xs text-destructive">
+              {riskError}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {/* VPS Required Warning for Live Trading */}
+        {vpsRequiredForLive && (
+          <Alert className="border-destructive/50 bg-destructive/10">
+            <AlertTriangle className="h-4 w-4 text-destructive" />
+            <AlertDescription className="text-xs text-destructive">
+              VPS required for live HFT trading. Deploy a VPS first.
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {/* Submit Button */}
+        <ActionButton
+          tooltip={side === 'buy' ? BUTTON_TOOLTIPS.buyOrder : BUTTON_TOOLTIPS.sellOrder}
+          className={`w-full ${side === 'buy' ? 'bg-success hover:bg-success/90' : 'bg-destructive hover:bg-destructive/90'}`}
+          onClick={handleSubmit}
+          disabled={isSubmitting || !!riskError || !exchange || !amount || vpsRequiredForLive}
+        >
+          {isSubmitting ? (
+            <Loader2 className="w-4 h-4 animate-spin mr-2" />
+          ) : side === 'buy' ? (
+            <TrendingUp className="w-4 h-4 mr-2" />
+          ) : (
+            <TrendingDown className="w-4 h-4 mr-2" />
+          )}
+          {side === 'buy' ? 'Buy' : 'Sell'} {symbol.split('/')[0]}
+        </ActionButton>
+      </CardContent>
+    </Card>
+  );
+}
