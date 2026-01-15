@@ -235,15 +235,58 @@ app.get('/api/system/status', async (req, res) => {
       }
     });
 
-    // 5. Build exchange list with balance and latency
+    // 6. Build exchange list with balance and latency
+    // Improved exchange name matching to handle case variations
     const exchangeList = activeExchanges.map(ex => {
-      const exchangeName = ex.exchange_name?.toLowerCase() || '';
-      const balance = exchangeBalances.get(exchangeName) || 0;
-      const latency = latencyMap.get(exchangeName) || null;
+      const exchangeNameDisplay = ex.exchange_name || ex.name || '';
+      const exchangeNameLower = String(exchangeNameDisplay).toLowerCase().trim();
+      
+      // Try multiple matching strategies for balance lookup
+      let balance = null;
+      
+      // Strategy 1: Exact lowercase match
+      balance = exchangeBalances.get(exchangeNameLower);
+      
+      // Strategy 2: Try variations (okx, binance, etc.)
+      if (balance === undefined || balance === null) {
+        const variations = [
+          exchangeNameLower,
+          exchangeNameLower.replace(/[^a-z0-9]/g, ''), // Remove special chars
+          exchangeNameDisplay.toLowerCase().replace(/\s+/g, ''), // Remove spaces
+        ];
+        
+        for (const variant of variations) {
+          if (exchangeBalances.has(variant)) {
+            balance = exchangeBalances.get(variant);
+            console.log(`[API] Matched balance for ${exchangeNameDisplay} using variant: ${variant} = ${balance}`);
+            break;
+          }
+        }
+      }
+      
+      // Strategy 3: Try matching against all keys (fuzzy match)
+      if (balance === undefined || balance === null) {
+        for (const [key, value] of exchangeBalances.entries()) {
+          if (key.includes(exchangeNameLower) || exchangeNameLower.includes(key)) {
+            balance = value;
+            console.log(`[API] Matched balance for ${exchangeNameDisplay} using fuzzy match: ${key} = ${balance}`);
+            break;
+          }
+        }
+      }
+      
+      // Default to 0 if no match found
+      if (balance === undefined || balance === null) {
+        balance = 0;
+        console.log(`[API] WARNING: No balance found for ${exchangeNameDisplay} (tried: ${exchangeNameLower})`);
+        console.log(`[API] Available balance keys:`, Array.from(exchangeBalances.keys()));
+      }
+      
+      const latency = latencyMap.get(exchangeNameLower) || null;
       
       return {
-        name: ex.exchange_name,
-        balance,
+        name: exchangeNameDisplay,
+        balance: Number(balance),
         latency
       };
     });
