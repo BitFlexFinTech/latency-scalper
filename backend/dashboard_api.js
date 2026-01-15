@@ -298,7 +298,7 @@ app.get('/api/system/status', async (req, res) => {
       .select('id', { count: 'exact', head: true })
       .gte('entry_time', yesterday);
 
-    // 7. Build response
+    // 8. Build response
     const response = {
       bot: {
         running: botRunning,
