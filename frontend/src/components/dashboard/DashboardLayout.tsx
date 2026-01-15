@@ -41,8 +41,6 @@ import { supabase } from '@/integrations/supabase/client';
 import { useSystemStatus } from '@/hooks/useSystemStatus';
 import { StatusDot } from '@/components/ui/StatusDot';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
-import { getSystemStatus, checkApiHealth } from '@/services/systemStatusApi';
-import { getBotStatus } from '@/services/botControlApi';
 
 const tabs = [
   { id: 'ai', label: 'AI', icon: Brain },
