@@ -110,7 +110,7 @@ app.get('/api/bot/status', async (req, res) => {
   }
 });
 
-// New endpoint: Get comprehensive system status from Supabase
+// FIXED: Comprehensive system status endpoint - SIMPLIFIED
 app.get('/api/system/status', async (req, res) => {
   const startTime = Date.now();
   try {
