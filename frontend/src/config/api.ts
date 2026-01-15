@@ -1,58 +1,97 @@
 /**
- * Central API Configuration
- * Single source of truth for all API endpoints
+ * API Configuration - Single Source of Truth for all API endpoints
+ * CRITICAL: All API calls MUST use these URLs
+ * NO hardcoded URLs anywhere else in the codebase
  */
 
-// Determine API base URL based on environment
-function getApiBaseUrl(): string {
-  if (typeof window === 'undefined') {
-    return 'http://localhost:3001';
-  }
+// VPS IP - this should match your actual VPS IP
+const VPS_IP = '107.191.61.107';
+const BACKEND_PORT = 3001;
 
-  const hostname = window.location.hostname;
-  const protocol = window.location.protocol;
+// Base API URL - always points to the backend API on VPS
+const BASE_API_URL = `http://${VPS_IP}:${BACKEND_PORT}/api`;
+
+/**
+ * All API endpoints - SINGLE SOURCE OF TRUTH
+ * If an endpoint is not listed here, it should not be called
+ */
+export const API_URLS = {
+  // System Status & Health
+  systemStatus: `${BASE_API_URL}/system/status`,
+  health: `${BASE_API_URL}/health`,
   
-  // Production: Running on VPS
-  if (hostname === '107.191.61.107') {
-    return 'http://107.191.61.107:3001';
-  }
-  
-  // Development: localhost
-  if (hostname === 'localhost' || hostname === '127.0.0.1') {
-    return 'http://localhost:3001';
-  }
-  
-  // Default: assume same server, use same hostname but port 3001
-  return `${protocol}//${hostname}:3001`;
+  // Bot Control
+  botStart: `${BASE_API_URL}/bot/start`,
+  botStop: `${BASE_API_URL}/bot/stop`,
+  botStatus: `${BASE_API_URL}/bot/status`,
+} as const;
+
+/**
+ * API Request Configuration
+ * These headers ensure NO CACHING and fresh data only
+ */
+export const API_REQUEST_CONFIG = {
+  headers: {
+    'Content-Type': 'application/json',
+    'Cache-Control': 'no-cache, no-store, must-revalidate',
+    'Pragma': 'no-cache',
+    'Expires': '0',
+  },
+  cache: 'no-store' as RequestCache,
+} as const;
+
+/**
+ * Polling intervals (in milliseconds)
+ * SINGLE SOURCE OF TRUTH for refresh rates
+ */
+export const POLLING_INTERVALS = {
+  systemStatus: 5000,    // 5 seconds - critical system data
+  botStatus: 5000,       // 5 seconds - bot running state
+  trades: 3000,          // 3 seconds - trade updates
+  balances: 5000,        // 5 seconds - balance updates
+  latency: 10000,        // 10 seconds - latency monitoring
+  health: 30000,         // 30 seconds - API health check
+} as const;
+
+/**
+ * API timeout configuration
+ */
+export const API_TIMEOUTS = {
+  default: 10000,        // 10 seconds
+  health: 5000,          // 5 seconds for health checks
+  critical: 15000,       // 15 seconds for critical operations
+} as const;
+
+/**
+ * Helper function to build URL with cache-busting timestamp
+ */
+export function buildUrl(baseUrl: string): string {
+  const timestamp = Date.now();
+  const separator = baseUrl.includes('?') ? '&' : '?';
+  return `${baseUrl}${separator}_t=${timestamp}`;
 }
 
-export const API_BASE_URL = getApiBaseUrl();
-
-// API Endpoints
-export const API_ENDPOINTS = {
-  // Bot Control
-  BOT_START: '/api/bot/start',
-  BOT_STOP: '/api/bot/stop',
-  BOT_STATUS: '/api/bot/status',
+/**
+ * Helper function to create fetch request with proper config
+ */
+export async function apiFetch<T>(
+  url: string,
+  options: RequestInit = {}
+): Promise<T> {
+  const urlWithCache = buildUrl(url);
   
-  // System Status
-  SYSTEM_STATUS: '/api/system/status',
-  HEALTH: '/api/health',
-} as const;
+  const response = await fetch(urlWithCache, {
+    ...API_REQUEST_CONFIG,
+    ...options,
+    headers: {
+      ...API_REQUEST_CONFIG.headers,
+      ...(options.headers || {}),
+    },
+  });
 
-// Full API URLs
-export const API_URLS = {
-  botStart: `${API_BASE_URL}${API_ENDPOINTS.BOT_START}`,
-  botStop: `${API_BASE_URL}${API_ENDPOINTS.BOT_STOP}`,
-  botStatus: `${API_BASE_URL}${API_ENDPOINTS.BOT_STATUS}`,
-  systemStatus: `${API_BASE_URL}${API_ENDPOINTS.SYSTEM_STATUS}`,
-  health: `${API_BASE_URL}${API_ENDPOINTS.HEALTH}`,
-} as const;
+  if (!response.ok) {
+    throw new Error(`API Error: ${response.status} ${response.statusText}`);
+  }
 
-// Log API configuration on module load (always in browser for debugging)
-if (typeof window !== 'undefined') {
-  console.log('[API Config] Base URL:', API_BASE_URL);
-  console.log('[API Config] API URLs:', API_URLS);
-  console.log('[API Config] Hostname:', window.location.hostname);
-  console.log('[API Config] Protocol:', window.location.protocol);
+  return response.json();
 }
