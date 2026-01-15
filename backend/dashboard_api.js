@@ -113,24 +113,26 @@ app.get('/api/bot/status', async (req, res) => {
 // FIXED: Comprehensive system status endpoint - SIMPLIFIED
 app.get('/api/system/status', async (req, res) => {
   const startTime = Date.now();
+  
   try {
-    console.log('[API] /api/system/status - Fetching system status...');
+    console.log('[API] ========================================');
+    console.log('[API] Fetching system status - FRESH DATA ONLY');
+    console.log('[API] Timestamp:', new Date().toISOString());
+    console.log('[API] ========================================');
     
     if (!supabase) {
-      console.error('[API] Supabase not configured');
       return res.status(503).json({ error: 'Supabase not configured' });
     }
 
-    // Get bot status from systemd
+    // 1. Get bot status from systemd
     let botRunning = false;
     try {
       const { stdout } = await execAsync('systemctl is-active scalper.service');
       botRunning = stdout.trim() === 'active';
-      console.log('[API] Bot status from systemd:', botRunning ? 'running' : 'stopped');
     } catch (error) {
-      console.log('[API] Bot service not active');
       botRunning = false;
     }
+    console.log('[API] Bot status:', botRunning ? 'running' : 'stopped');
 
     // Get exchange connections
     console.log('[API] ========================================');
