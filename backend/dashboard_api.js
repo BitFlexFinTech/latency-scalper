@@ -212,10 +212,7 @@ app.get('/api/system/status', async (req, res) => {
       console.error('[API] Error fetching exchanges:', exchangesError);
     }
 
-    const activeExchanges = exchanges || [];
-    console.log('[API] Active exchanges:', activeExchanges.length);
-
-    // 4. Get latest latency samples
+    // 5. Get latest latency samples
     console.log('[API] Fetching latency data...');
     const { data: latencyData, error: latencyError } = await supabase
       .from('latency_logs')
