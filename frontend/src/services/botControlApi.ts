@@ -1,62 +1,98 @@
-// Bot Control API Service
-// Connects to backend API for systemd bot control
+/**
+ * Bot Control API Service
+ * Handles start/stop/status commands for the trading bot
+ */
 
-import { API_URLS } from '@/config/api';
+import { API_URLS, apiFetch, API_TIMEOUTS } from '@/config/api';
 
-export interface BotStatus {
+export interface BotStatusResponse {
   status: 'running' | 'stopped';
   isRunning: boolean;
 }
 
-export async function startBot(): Promise<{ success: boolean; message: string }> {
+export interface BotCommandResponse {
+  success: boolean;
+  message: string;
+  error?: string;
+}
+
+/**
+ * Start the trading bot
+ */
+export async function startBot(): Promise<BotCommandResponse> {
   try {
-    console.log('[botControlApi] Starting bot:', API_URLS.botStart);
-    const response = await fetch(API_URLS.botStart, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-    });
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-    const result = await response.json();
-    console.log('[botControlApi] Start bot result:', result);
-    return result;
+    console.log('[botControlApi] Starting bot...');
+    
+    const data = await apiFetch<BotCommandResponse>(
+      API_URLS.botStart,
+      {
+        method: 'POST',
+        signal: AbortSignal.timeout(API_TIMEOUTS.critical),
+      }
+    );
+    
+    console.log('[botControlApi] Bot start result:', data);
+    return data;
   } catch (error) {
     console.error('[botControlApi] Error starting bot:', error);
-    throw error;
+    return {
+      success: false,
+      message: 'Failed to start bot',
+      error: error instanceof Error ? error.message : 'Unknown error',
+    };
   }
 }
 
-export async function stopBot(): Promise<{ success: boolean; message: string }> {
+/**
+ * Stop the trading bot
+ */
+export async function stopBot(): Promise<BotCommandResponse> {
   try {
-    console.log('[botControlApi] Stopping bot:', API_URLS.botStop);
-    const response = await fetch(API_URLS.botStop, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-    });
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-    const result = await response.json();
-    console.log('[botControlApi] Stop bot result:', result);
-    return result;
+    console.log('[botControlApi] Stopping bot...');
+    
+    const data = await apiFetch<BotCommandResponse>(
+      API_URLS.botStop,
+      {
+        method: 'POST',
+        signal: AbortSignal.timeout(API_TIMEOUTS.critical),
+      }
+    );
+    
+    console.log('[botControlApi] Bot stop result:', data);
+    return data;
   } catch (error) {
     console.error('[botControlApi] Error stopping bot:', error);
-    throw error;
+    return {
+      success: false,
+      message: 'Failed to stop bot',
+      error: error instanceof Error ? error.message : 'Unknown error',
+    };
   }
 }
 
-export async function getBotStatus(): Promise<BotStatus> {
+/**
+ * Get bot status
+ * NOTE: Prefer using the store's systemStatus instead of calling this directly
+ */
+export async function getBotStatus(): Promise<BotStatusResponse> {
   try {
-    const response = await fetch(API_URLS.botStatus);
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-    const result = await response.json();
-    return result;
+    console.log('[botControlApi] Fetching bot status...');
+    
+    const data = await apiFetch<BotStatusResponse>(
+      API_URLS.botStatus,
+      {
+        method: 'GET',
+        signal: AbortSignal.timeout(API_TIMEOUTS.default),
+      }
+    );
+    
+    console.log('[botControlApi] Bot status:', data);
+    return data;
   } catch (error) {
     console.error('[botControlApi] Error fetching bot status:', error);
-    // Return safe default instead of throwing
-    return { status: 'stopped', isRunning: false };
+    return {
+      status: 'stopped',
+      isRunning: false,
+    };
   }
 }
