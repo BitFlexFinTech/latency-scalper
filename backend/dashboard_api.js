@@ -291,7 +291,7 @@ app.get('/api/system/status', async (req, res) => {
       };
     });
 
-    // 6. Get recent trades count
+    // 7. Get recent trades count
     const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     const { count: tradesCount } = await supabase
       .from('trade_logs')
