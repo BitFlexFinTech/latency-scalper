@@ -328,10 +328,15 @@ app.get('/api/system/status', async (req, res) => {
       responseTime: Date.now() - startTime
     };
 
+    // Calculate total balance from exchange list
+    const calculatedTotalBalance = exchangeList.reduce((sum, ex) => sum + (ex.balance || 0), 0);
+    
     console.log('[API] Response summary:', {
       botRunning: response.bot.running,
       exchangesConnected: response.exchanges.connected,
-      totalBalance,
+      totalBalance: calculatedTotalBalance,
+      balanceSource: balancesFromConnections ? 'exchange_connections (CURRENT)' : 'balance_history (SNAPSHOT)',
+      exchangeBalances: exchangeList.map(ex => `${ex.name}: $${ex.balance}`),
       latencySamples: response.latency.recent,
       trades24h: response.trades.last24h,
       responseTime: response.responseTime
