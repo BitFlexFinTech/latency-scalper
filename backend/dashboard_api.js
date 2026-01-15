@@ -260,9 +260,6 @@ app.get('/api/system/status', async (req, res) => {
     console.log('[API] ========================================');
 
     res.json(response);
-      console.log('[API] ✓ Successfully queried with select(*)');
-      const firstRow = allExchangesRaw[0];
-      availableColumns = Object.keys(firstRow);
       console.log('[API] ========================================');
       console.log('[API] DISCOVERED COLUMNS:', availableColumns.join(', '));
       console.log('[API] Total rows found:', allExchangesRaw.length);
