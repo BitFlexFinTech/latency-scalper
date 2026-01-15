@@ -151,9 +151,14 @@ export function DashboardLayout() {
     }
   };
 
-  // SSOT FIX: Determine API status from backend API health check (not bot_status table)
-  const apiStatus = apiOnline ? 'Online' : 'Offline';
-  const apiStatusColor = apiOnline ? 'success' : 'error';
+  // Determine latency color
+  const getLatencyColor = (latency: number | null): string => {
+    if (!latency) return 'text-muted-foreground';
+    if (latency <= 40) return 'text-green-500';
+    if (latency <= 70) return 'text-yellow-500';
+    if (latency <= 85) return 'text-orange-500';
+    return 'text-red-500';
+  };
 
   return (
     <TooltipProvider>
@@ -248,14 +253,14 @@ export function DashboardLayout() {
           </div>
         </header>
 
-        {/* Status Bar - BOT running, LIVE, IP, Latency, API status - REAL DATA ONLY from NEW BOT */}
+        {/* Status Bar - REAL DATA ONLY from Global Store */}
         <div className="border-b border-border bg-muted/30 px-4 py-1.5 flex items-center gap-4 text-xs">
           <div className="flex items-center gap-2">
             <StatusDot 
-              color={botStatus?.is_running ? 'success' : 'muted'} 
-              pulse={botStatus?.is_running} 
+              color={systemStatus.botRunning ? 'success' : 'muted'} 
+              pulse={systemStatus.botRunning} 
             />
-            <span className="font-medium">BOT {botStatus?.is_running ? 'running' : 'stopped'}</span>
+            <span className="font-medium">BOT {systemStatus.botRunning ? 'running' : 'stopped'}</span>
           </div>
           
           <div className="flex items-center gap-2">
@@ -263,80 +268,49 @@ export function DashboardLayout() {
             <span className="font-medium text-green-500">LIVE</span>
           </div>
 
-          {vpsIp && (
+          {systemStatus.vps.ip && (
             <div className="flex items-center gap-2">
               <span className="text-muted-foreground">IP:</span>
-              <span className="font-mono">{vpsIp}</span>
+              <span className="font-mono">{systemStatus.vps.ip}</span>
             </div>
           )}
 
-          {vpsLatency !== null && (
+          {systemStatus.avgLatency !== null && (
             <div className="flex items-center gap-2">
               <span className="text-muted-foreground">Latency:</span>
               <span className={cn(
                 "font-mono font-medium",
-                vpsLatency <= 40 ? 'text-green-500' :
-                vpsLatency <= 70 ? 'text-yellow-500' :
-                vpsLatency <= 85 ? 'text-orange-500' : 'text-red-500'
+                systemStatus.avgLatency <= 40 ? 'text-green-500' :
+                systemStatus.avgLatency <= 70 ? 'text-yellow-500' :
+                systemStatus.avgLatency <= 85 ? 'text-orange-500' : 'text-red-500'
               )}>
-                {vpsLatency}ms
+                {systemStatus.avgLatency}ms
               </span>
             </div>
           )}
 
-          {/* CRITICAL FIX: API status from bot_status.is_running (NEW BOT) - NOT from old tables */}
           <div className="flex items-center gap-2">
             <StatusDot 
-              color={apiStatusColor} 
-              pulse={botStatus?.is_running} 
+              color={systemStatus.vps.online ? 'success' : 'error'} 
+              pulse={systemStatus.botRunning} 
             />
-            <span className="text-muted-foreground">API {apiStatus}</span>
+            <span className="text-muted-foreground">
+              API {systemStatus.vps.online ? 'Online' : 'Offline'}
+            </span>
           </div>
 
           <div className="ml-auto flex items-center gap-2">
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-6 px-2 text-xs"
-              onClick={async () => {
-                // Real VPS ping action - fetch latest latency from NEW BOT
-                const { data: okxData } = await supabase
-                  .from('latency_logs')
-                  .select('latency_ms, venue')
-                  .eq('venue', 'okx')
-                  .order('ts', { ascending: false })
-                  .limit(1)
-                  .single();
-                
-                const { data: binanceData } = await supabase
-                  .from('latency_logs')
-                  .select('latency_ms, venue')
-                  .eq('venue', 'binance')
-                  .order('ts', { ascending: false })
-                  .limit(1)
-                  .single();
-                
-                if (okxData || binanceData) {
-                  const latencies = [okxData?.latency_ms, binanceData?.latency_ms].filter(Boolean) as number[];
-                  if (latencies.length > 0) {
-                    const avg = latencies.reduce((sum, l) => sum + l, 0) / latencies.length;
-                    console.log(`[Dashboard] VPS→Exchange Latency: ${Math.round(avg)}ms (OKX: ${okxData?.latency_ms}ms, Binance: ${binanceData?.latency_ms}ms)`);
-                  }
-                }
-              }}
-            >
-              Ping VPS
-            </Button>
-          </div>
-
-          <div className="flex items-center gap-2">
             <span className="text-muted-foreground">INFRA</span>
             <StatusDot 
-              color={botStatus?.is_running ? 'success' : 'muted'} 
-              pulse={botStatus?.is_running} 
+              color={systemStatus.vps.online ? 'success' : 'muted'} 
+              pulse={systemStatus.vps.online} 
             />
             <span className="font-medium">
-              {vps.provider ? vps.provider.charAt(0).toUpperCase() + vps.provider.slice(1) : 'Vultr'} {vpsLatency !== null ? `${vpsLatency}ms` : ''}
+              {systemStatus.vps.provider ? 
+                systemStatus.vps.provider.charAt(0).toUpperCase() + systemStatus.vps.provider.slice(1) : 
+                'Vultr'
+              }
+              {systemStatus.avgLatency && ` ${systemStatus.avgLatency}ms`}
             </span>
           </div>
         </div>
