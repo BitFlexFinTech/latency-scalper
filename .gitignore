@@ -35,3 +35,4 @@ pm2-*.log
 tmp/
 temp/
 *.tmp
+# Auto-update test
