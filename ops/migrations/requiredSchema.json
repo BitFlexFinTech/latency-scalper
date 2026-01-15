@@ -1,0 +1,39 @@
+{
+  "latency_logs": {
+    "venue": "text",
+    "ts": "timestamp",
+    "latency_ms": "integer"
+  },
+  "trade_logs": {
+    "id": "uuid",
+    "symbol": "text",
+    "exchange": "text",
+    "side": "text",
+    "entry_price": "numeric",
+    "exit_price": "numeric",
+    "position_size_usd": "numeric",
+    "profit_usd": "numeric",
+    "net_profit_usd": "numeric",
+    "status": "text",
+    "entry_time": "timestamp",
+    "exit_time": "timestamp",
+    "duration_ms": "integer"
+  },
+  "exchange_connections": {
+    "id": "uuid",
+    "exchange_name": "text",
+    "is_connected": "boolean",
+    "is_active": "boolean",
+    "last_ping_ms": "integer",
+    "balance_usdt": "numeric",
+    "balance_updated_at": "timestamp",
+    "last_error": "text",
+    "last_error_at": "timestamp"
+  },
+  "bot_status": {
+    "id": "uuid",
+    "is_running": "boolean",
+    "last_heartbeat": "timestamp",
+    "updated_at": "timestamp"
+  }
+}

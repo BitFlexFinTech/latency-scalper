@@ -1,0 +1,775 @@
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { Card } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { Progress } from '@/components/ui/progress';
+import { 
+  Play, Square, RefreshCw, Send, Activity, RotateCcw, FileText, Server, Zap, AlertTriangle, XCircle, Wifi
+} from 'lucide-react';
+import { supabase } from '@/integrations/supabase/client';
+import { checkVpsApiHealth, pingVpsExchanges } from '@/services/vpsApiService';
+import { toast } from 'sonner';
+import { useAppStore } from '@/store/useAppStore';
+import { useVPSHealthPolling } from '@/hooks/useVPSHealthPolling';
+import { cn } from '@/lib/utils';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
+import { StatusDot, StatusDotColor } from '@/components/ui/StatusDot';
+
+type BotStatus = 'running' | 'stopped' | 'standby' | 'idle' | 'error' | 'starting';
+type StartupStage = 'idle' | 'connecting' | 'verifying' | 'waiting_trade' | 'active' | 'timeout';
+
+export function UnifiedControlBar() {
+  // Get state from SSOT store
+  const { activeVPS, syncFromDatabase } = useAppStore();
+
+  // VPS Health Polling - provides real-time VPS status + trading latency
+  const { health: vpsHealth, isPolling: vpsPolling, refresh: refreshVpsHealth, forceSync } = useVPSHealthPolling({
+    pollIntervalMs: 30000,
+    enabled: true,
+  });
+
+  // Local state
+  const [botStatus, setBotStatus] = useState<BotStatus>('stopped');
+  const [isLoading, setIsLoading] = useState(false);
+  const [showStartConfirm, setShowStartConfirm] = useState(false);
+  
+  // Startup progress state with ref to prevent stale closure issues
+  const [startupStage, setStartupStage] = useState<StartupStage>('idle');
+  const [startupProgress, setStartupProgress] = useState(0);
+  const startupStageRef = useRef<StartupStage>('idle');
+  const startTimeRef = useRef<number | null>(null);
+  
+  const [deploymentId, setDeploymentId] = useState<string | null>(null);
+  
+  // VPS API status
+  const [vpsApiStatus, setVpsApiStatus] = useState<{ ok: boolean; latencyMs: number | null }>({ ok: false, latencyMs: null });
+  const [isTestingApi, setIsTestingApi] = useState(false);
+
+  // Sync startupStage with ref
+  useEffect(() => {
+    startupStageRef.current = startupStage;
+  }, [startupStage]);
+
+  // CRITICAL FIX: Fetch bot status from bot_status table (NEW BOT) - NOT from dashboard-state edge function
+  const fetchBotStatus = useCallback(async () => {
+    try {
+      // Read directly from bot_status table (NEW BOT) - NO edge function, NO old tables
+      const { data: botStatus, error } = await supabase
+        .from('bot_status')
+        .select('is_running, last_heartbeat')
+        .order('updated_at', { ascending: false })
+        .limit(1)
+        .single();
+      
+      if (error) {
+        console.error('[UnifiedControlBar] bot_status error:', error);
+        setBotStatus('stopped');
+        return;
+      }
+      
+      if (botStatus) {
+        const dbStatus: BotStatus = botStatus.is_running ? 'running' : 'stopped';
+        // Only update if not in startup sequence
+        if (startupStageRef.current === 'idle' || startupStageRef.current === 'active') {
+          setBotStatus(dbStatus);
+        }
+      } else {
+        setBotStatus('stopped');
+      }
+
+      // CRITICAL FIX: Get deployment ID from hft_deployments (if exists) - but this is only for bot control API calls
+      // The actual bot status comes from bot_status table
+      const { data: deployment } = await supabase
+        .from('hft_deployments')
+        .select('id, server_id')
+        .in('status', ['active', 'running'])
+        .limit(1)
+        .single();
+      
+      if (deployment) {
+        setDeploymentId(deployment.id || deployment.server_id);
+      }
+    } catch {
+      if (startupStageRef.current === 'idle') {
+        setBotStatus('stopped');
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchBotStatus();
+    const interval = setInterval(fetchBotStatus, 10000);
+    return () => clearInterval(interval);
+  }, [fetchBotStatus]);
+
+  // CRITICAL FIX: Check API status from bot_status.is_running (NEW BOT) - NOT from edge function
+  useEffect(() => {
+    const checkApi = async () => {
+      // Read bot status from bot_status table (NEW BOT) - if bot is running, API is online
+      const { data: botStatus } = await supabase
+        .from('bot_status')
+        .select('is_running, last_heartbeat')
+        .order('updated_at', { ascending: false })
+        .limit(1)
+        .single();
+      
+      if (botStatus) {
+        const isOnline = botStatus.is_running || false;
+        // Check if heartbeat is recent (within last 2 minutes)
+        const heartbeatAge = botStatus.last_heartbeat 
+          ? Date.now() - new Date(botStatus.last_heartbeat).getTime()
+          : Infinity;
+        const isRecent = heartbeatAge < 120000; // 2 minutes
+        
+        setVpsApiStatus({ 
+          ok: isOnline && isRecent, 
+          latencyMs: isRecent ? Math.round(heartbeatAge) : null 
+        });
+      } else {
+        setVpsApiStatus({ ok: false, latencyMs: null });
+      }
+    };
+    checkApi();
+    const interval = setInterval(checkApi, 5000); // Check every 5 seconds
+    return () => clearInterval(interval);
+  }, []);
+
+  // CRITICAL FIX: Clear error state by updating bot_status table (NEW BOT) - NOT old tables
+  const handleClearError = async () => {
+    setIsLoading(true);
+    try {
+      // Update bot_status table (NEW BOT) - this is the single source of truth
+      const { data: status } = await supabase
+        .from('bot_status')
+        .select('id')
+        .limit(1)
+        .single();
+      
+      if (status) {
+        await supabase
+          .from('bot_status')
+          .update({ 
+            is_running: false,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', status.id);
+      } else {
+        // Create new bot_status entry if it doesn't exist
+        await supabase
+          .from('bot_status')
+          .insert({ is_running: false });
+      }
+      
+      setBotStatus('stopped');
+      setStartupStage('idle');
+      setStartupProgress(0);
+      toast.success('Error cleared - bot status reset to stopped');
+      refreshVpsHealth();
+      syncFromDatabase();
+    } catch (err) {
+      console.error('Failed to clear error:', err);
+      toast.error('Failed to clear error state');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Test VPS API handler - uses edge function to avoid CORS
+  const handleTestVpsApi = async () => {
+    setIsTestingApi(true);
+    try {
+      // Use edge function - no IP needed, it looks up from DB
+      const healthResult = await checkVpsApiHealth();
+      setVpsApiStatus({ ok: healthResult.ok, latencyMs: healthResult.responseMs });
+      
+      if (healthResult.ok) {
+        const pingResult = await pingVpsExchanges();
+        if (pingResult.success && pingResult.pings.length > 0) {
+          const summary = pingResult.pings
+            .map((r) => `${r.exchange}: ${r.latencyMs}ms`)
+            .join(', ');
+          toast.success(`VPS API OK (${healthResult.responseMs}ms) | ${summary}`);
+        } else {
+          toast.success(`VPS API OK (${healthResult.responseMs}ms)`);
+        }
+      } else {
+        toast.error(`VPS API Error: ${healthResult.error || 'Unknown error'}`);
+      }
+    } catch (err) {
+      toast.error('VPS API test failed');
+    } finally {
+      setIsTestingApi(false);
+    }
+  };
+
+  // CRITICAL FIX: Subscribe to first trade from trade_logs (NEW BOT) - NOT trade_logs (OLD BOT)
+  const subscribeToFirstTrade = useCallback(() => {
+    const channel = supabase.channel('first-trade-watch-' + Date.now())
+      .on('postgres_changes', { 
+        event: 'INSERT', 
+        schema: 'public', 
+        table: 'trade_logs'  // ✅ NEW BOT TABLE
+      }, (payload) => {
+        console.log('[UnifiedControlBar] First trade detected from NEW BOT:', payload);
+        setStartupProgress(100);
+        setStartupStage('active');
+        setBotStatus('running');
+        toast.success('First trade executed!');
+        syncFromDatabase();
+        supabase.removeChannel(channel);
+      })
+      .subscribe();
+
+    return channel;
+  }, [syncFromDatabase]);
+
+  // Handle startup with immediate trade via start-live-now
+  const startBotWithProgress = async () => {
+    setStartupStage('connecting');
+    setStartupProgress(10);
+    startTimeRef.current = Date.now();
+    
+    try {
+      // Stage 1: Call bot-lifecycle for pure bot start (no trade)
+      console.log('[UnifiedControlBar] Calling bot-lifecycle start...');
+      setBotStatus('starting');
+      
+      const { data, error } = await supabase.functions.invoke('bot-lifecycle', {
+        body: { action: 'start' }
+      });
+      
+      if (error) {
+        console.error('[UnifiedControlBar] bot-lifecycle error:', error);
+        toast.error('Failed to start: ' + error.message);
+        setStartupStage('idle');
+        setStartupProgress(0);
+        setBotStatus('error');
+        return;
+      }
+      
+      console.log('[UnifiedControlBar] bot-lifecycle result:', data);
+      setStartupProgress(60);
+      setStartupStage('verifying');
+      
+      // Handle failure
+      if (!data?.success) {
+        console.log('[UnifiedControlBar] Start failed:', data?.message);
+        toast.error('Failed to start bot', {
+          description: data?.message || 'Unknown error',
+          duration: 8000,
+        });
+        setStartupStage('idle');
+        setStartupProgress(0);
+        setBotStatus(data?.botStatus || 'error');
+        return;
+      }
+      
+      // Bot started successfully
+      setStartupProgress(100);
+      setStartupStage('active');
+      setBotStatus(data.botStatus || 'running');
+      
+      toast.success('✅ Bot started successfully', {
+        description: data.message || 'Bot is now running in LIVE mode',
+        duration: 5000,
+      });
+      
+      syncFromDatabase();
+      refreshVpsHealth();
+      
+    } catch (err) {
+      console.error('[UnifiedControlBar] Failed to start bot:', err);
+      toast.error('Failed to start bot');
+      setStartupStage('idle');
+      setStartupProgress(0);
+      setBotStatus('error');
+    } finally {
+      setIsLoading(false);
+      setShowStartConfirm(false);
+    }
+  };
+
+  const handleStartBot = async () => {
+    // Always confirm before starting (LIVE mode)
+    if (!showStartConfirm) {
+      setShowStartConfirm(true);
+      return;
+    }
+    
+    if (!deploymentId) {
+      toast.error('No VPS deployment found. Deploy a VPS first.');
+      return;
+    }
+    
+    setIsLoading(true);
+    await startBotWithProgress();
+  };
+
+  const handleStopBot = async () => {
+    if (!deploymentId) {
+      toast.error('No deployment selected');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const { data, error } = await supabase.functions.invoke('bot-lifecycle', {
+        body: { 
+          action: 'stop',
+          deploymentId: deploymentId
+        }
+      });
+
+      if (error) {
+        console.error('Stop bot error:', error);
+        toast.error(`Failed to stop bot: ${error.message}`);
+        return;
+      }
+
+      if (data?.success) {
+        toast.success('Bot stopped successfully');
+        setBotStatus('stopped');
+        setStartupStage('idle');
+        setStartupProgress(0);
+        await fetchBotStatus();
+        syncFromDatabase();
+      } else {
+        toast.error(data?.message || 'Failed to stop bot');
+      }
+    } catch (err: any) {
+      console.error('Stop bot exception:', err);
+      toast.error(`Error stopping bot: ${err.message}`);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleRestartBot = async () => {
+    if (!deploymentId) {
+      toast.error('No deployment selected');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const { data, error } = await supabase.functions.invoke('bot-lifecycle', {
+        body: { 
+          action: 'restart',
+          deploymentId: deploymentId
+        }
+      });
+
+      if (error) {
+        console.error('Restart bot error:', error);
+        toast.error(`Failed to restart bot: ${error.message}`);
+        return;
+      }
+
+      if (data?.success) {
+        toast.success('Bot restarted successfully');
+        setTimeout(async () => {
+          await fetchBotStatus();
+          syncFromDatabase();
+        }, 2000);
+      } else {
+        toast.error(data?.message || 'Failed to restart bot');
+      }
+    } catch (err: any) {
+      console.error('Restart bot exception:', err);
+      toast.error(`Error restarting bot: ${err.message}`);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleViewLogs = async () => {
+    setIsLoading(true);
+    try {
+      const { data, error } = await supabase.functions.invoke('bot-control', {
+        body: { action: 'logs', deploymentId }
+      });
+      
+      if (error) throw error;
+      
+      console.log('[Bot Logs]', data?.logs);
+      toast.info('Logs printed to console (F12)');
+    } catch (err) {
+      console.error('Failed to fetch logs:', err);
+      toast.error('Failed to fetch logs');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleSyncBalances = async () => {
+    setIsLoading(true);
+    try {
+      const { error } = await supabase.functions.invoke('poll-balances');
+      if (error) throw error;
+      toast.success('Balances synced');
+      syncFromDatabase();
+    } catch (err) {
+      console.error('Sync failed:', err);
+      toast.error('Sync failed');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleTestTelegram = async () => {
+    setIsLoading(true);
+    try {
+      const { error } = await supabase.functions.invoke('telegram-bot', {
+        body: { 
+          action: 'send-message',
+          message: '🤖 <b>Your Bot is running in LIVE mode.</b>\n\n✅ Connection test successful!'
+        }
+      });
+      if (error) throw error;
+      toast.success('Test message sent to Telegram');
+    } catch (err) {
+      console.error('Telegram test failed:', err);
+      toast.error('Failed to send Telegram message');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const isStartingUp = startupStage !== 'idle' && startupStage !== 'active';
+
+  const statusColor = {
+    running: 'bg-success',
+    stopped: 'bg-destructive',
+    standby: 'bg-muted-foreground', // Docker up but not trading
+    idle: 'bg-warning',
+    error: 'bg-destructive',
+    starting: 'bg-warning'
+  };
+
+  const getStartupMessage = () => {
+    switch (startupStage) {
+      case 'connecting': return '🔗 Connecting to VPS...';
+      case 'verifying': return '🤖 Verifying bot health...';
+      case 'waiting_trade': return '📈 Bot running, waiting for trade signals...';
+      case 'active': return '✅ Trading active!';
+      default: return '';
+    }
+  };
+
+  return (
+    <TooltipProvider delayDuration={200}>
+      <Card className="p-2 bg-card/50 border-border/50">
+        <div className="flex items-center justify-between gap-4 flex-wrap">
+          {/* Bot Status Section */}
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2">
+              {/* Status dot - uses StatusDot component for consistency */}
+              <StatusDot 
+                color={
+                  botStatus === 'running' ? 'success' :
+                  botStatus === 'starting' ? 'warning' :
+                  botStatus === 'standby' ? 'muted' :
+                  botStatus === 'idle' ? 'warning' :
+                  'destructive'
+                }
+                pulse={botStatus === 'running' || botStatus === 'starting'}
+                size="sm"
+              />
+              <span className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                Bot
+              </span>
+              <Badge 
+                variant={botStatus === 'running' ? 'default' : 'secondary'}
+                className="text-[10px] px-1.5 py-0"
+              >
+                {botStatus}
+              </Badge>
+            </div>
+
+            {/* Live Mode Indicator */}
+            <div className="flex items-center gap-2 pl-3 border-l border-border/50">
+              <Badge variant="destructive" className="text-[10px] px-1.5 py-0">
+                LIVE
+              </Badge>
+            </div>
+
+            {/* VPS Status Indicator - NEW */}
+            <div className="flex items-center gap-2 pl-3 border-l border-border/50">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <div className="flex items-center gap-1.5 cursor-help">
+                    <Server className={cn(
+                      "w-3 h-3",
+                      vpsHealth.status === 'healthy' ? 'text-success' : 
+                      vpsHealth.status === 'unreachable' ? 'text-destructive' : 'text-muted-foreground'
+                    )} />
+                    <span className="text-[10px] font-mono text-muted-foreground">
+                      {vpsHealth.ipAddress || 'No VPS'}
+                    </span>
+                    {vpsHealth.status === 'healthy' && (
+                      <StatusDot color="success" pulse size="xs" />
+                    )}
+                  </div>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">
+                  <div className="text-xs space-y-1">
+                    <p>VPS: {vpsHealth.provider || 'Unknown'} ({vpsHealth.region || 'N/A'})</p>
+                    <p>Status: {vpsHealth.status}</p>
+                    <p>Bot: {vpsHealth.botStatus || 'N/A'}</p>
+                  </div>
+                </TooltipContent>
+              </Tooltip>
+            </div>
+
+            {/* Trading Latency - NEW (HFT-relevant!) */}
+            {vpsHealth.tradingLatencyMs !== null && (
+              <div className="flex items-center gap-2 pl-3 border-l border-border/50">
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <div className="flex items-center gap-1 cursor-help">
+                      <Zap className={cn(
+                        "w-3 h-3",
+                        vpsHealth.tradingLatencyMs < 50 ? 'text-success' :
+                        vpsHealth.tradingLatencyMs < 100 ? 'text-warning' : 'text-destructive'
+                      )} />
+                      <span className={cn(
+                        "text-[10px] font-mono font-bold",
+                        vpsHealth.tradingLatencyMs < 50 ? 'text-success' :
+                        vpsHealth.tradingLatencyMs < 100 ? 'text-warning' : 'text-destructive'
+                      )}>
+                        {vpsHealth.tradingLatencyMs}ms
+                      </span>
+                    </div>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom">
+                    <p className="text-xs">VPS→Exchange trading latency (avg)</p>
+                    <p className="text-[10px] text-muted-foreground">This is the actual HFT latency</p>
+              </TooltipContent>
+            </Tooltip>
+          </div>
+        )}
+
+        {/* VPS API Status - NEW */}
+        {vpsHealth.ipAddress && (
+          <div className="flex items-center gap-2 pl-3 border-l border-border/50">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <div className="flex items-center gap-1.5 cursor-help">
+                  <Wifi className={cn(
+                    "w-3 h-3",
+                    vpsApiStatus.ok ? 'text-success' : 'text-destructive'
+                  )} />
+                  <span className={cn(
+                    "text-[10px] font-mono",
+                    vpsApiStatus.ok ? 'text-success' : 'text-destructive'
+                  )}>
+                    {vpsApiStatus.ok ? `API ${vpsApiStatus.latencyMs}ms` : 'API Offline'}
+                  </span>
+                </div>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">
+                <p className="text-xs">VPS Bot API Status</p>
+                <p className="text-[10px] text-muted-foreground">Click "Test" to ping exchanges from VPS</p>
+              </TooltipContent>
+            </Tooltip>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={handleTestVpsApi}
+              disabled={isTestingApi}
+              className="h-5 px-1.5 text-[9px]"
+            >
+              {isTestingApi ? <RefreshCw className="w-2.5 h-2.5 animate-spin" /> : 'Ping VPS'}
+            </Button>
+          </div>
+        )}
+
+        {/* Error State - Clear Error Button */}
+        {botStatus === 'error' && (
+          <div className="flex items-center gap-2 pl-3 border-l border-destructive/50 bg-destructive/10 px-2 py-1 rounded">
+            <XCircle className="w-3.5 h-3.5 text-destructive" />
+            <span className="text-[10px] text-destructive font-medium">Bot Error</span>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleClearError}
+              disabled={isLoading}
+              className="h-5 px-2 text-[9px] border-destructive text-destructive hover:bg-destructive hover:text-destructive-foreground"
+            >
+              Clear Error
+            </Button>
+          </div>
+        )}
+
+            {/* Desync Warning - requires manual action */}
+            {vpsHealth.desync && (
+              <div className="flex items-center gap-2 pl-2 bg-warning/10 px-2 py-1 rounded">
+                <AlertTriangle className="w-3.5 h-3.5 text-warning" />
+                <span className="text-[10px] text-warning font-medium">
+                  VPS: {vpsHealth.botStatus} ≠ UI: {botStatus}
+                </span>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={async () => {
+                    // Manually update DB to match VPS reality
+                    setIsLoading(true);
+                    try {
+                      const updateTime = new Date().toISOString();
+                      const newStatus = vpsHealth.botStatus === 'running' ? 'running' : 'stopped';
+                      await supabase.from('trading_config')
+                        .update({ 
+                          bot_status: newStatus, 
+                          trading_enabled: newStatus === 'running',
+                          updated_at: updateTime 
+                        })
+                        .neq('id', '00000000-0000-0000-0000-000000000000');
+                      setBotStatus(newStatus as BotStatus);
+                      toast.success(`Synced UI to VPS state: ${newStatus}`);
+                      refreshVpsHealth();
+                    } catch (err) {
+                      toast.error('Failed to sync');
+                    } finally {
+                      setIsLoading(false);
+                    }
+                  }}
+                  disabled={isLoading}
+                  className="h-5 px-2 text-[9px] border-warning text-warning hover:bg-warning hover:text-warning-foreground"
+                >
+                  Adopt VPS State
+                </Button>
+              </div>
+            )}
+          </div>
+
+          {/* Control Buttons */}
+          <div className="flex items-center gap-1.5">
+            {botStatus === 'running' || botStatus === 'starting' ? (
+              <Button 
+                size="sm" 
+                variant="destructive" 
+                onClick={handleStopBot}
+                disabled={isLoading}
+                className="h-7 text-xs px-2"
+              >
+                <Square className="w-3 h-3 mr-1" />
+                Stop
+              </Button>
+            ) : (
+              <Button 
+                size="sm" 
+                onClick={handleStartBot}
+                disabled={isLoading || !deploymentId}
+                className="h-7 text-xs px-2 bg-success hover:bg-success/90"
+              >
+                <Play className="w-3 h-3 mr-1" />
+                Start
+              </Button>
+            )}
+
+            <Button 
+              size="sm" 
+              variant="outline" 
+              onClick={handleRestartBot}
+              disabled={isLoading || botStatus !== 'running'}
+              className="h-7 text-xs px-2"
+            >
+              <RotateCcw className="w-3 h-3" />
+            </Button>
+
+            <Button 
+              size="sm" 
+              variant="outline" 
+              onClick={handleViewLogs}
+              disabled={isLoading || !deploymentId}
+              className="h-7 text-xs px-2"
+              title="View bot logs (prints to console)"
+            >
+              <FileText className="w-3 h-3" />
+            </Button>
+
+            <div className="h-4 w-px bg-border/50" />
+
+            <Button 
+              size="sm" 
+              variant="outline" 
+              onClick={handleSyncBalances}
+              disabled={isLoading}
+              className="h-7 text-xs px-2"
+            >
+              <RefreshCw className={`w-3 h-3 mr-1 ${isLoading ? 'animate-spin' : ''}`} />
+              Sync
+            </Button>
+
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button 
+                  size="sm" 
+                  variant="outline" 
+                  onClick={handleTestTelegram}
+                  disabled={isLoading}
+                  className="h-7 w-7 px-0"
+                >
+                  <Send className="w-3.5 h-3.5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                <p>Send test message to Telegram</p>
+              </TooltipContent>
+            </Tooltip>
+
+            <Activity className={`w-4 h-4 ml-2 ${botStatus === 'running' ? 'text-success' : 'text-muted-foreground'}`} />
+          </div>
+        </div>
+
+        {/* Startup Progress Bar */}
+        {isStartingUp && (
+          <div className="mt-2 space-y-1">
+            <div className="flex items-center justify-between text-xs">
+              <span className="text-muted-foreground">{getStartupMessage()}</span>
+              <span className="text-muted-foreground">{startupProgress}%</span>
+            </div>
+            <Progress value={startupProgress} className="h-1" />
+          </div>
+        )}
+        </Card>
+
+      {/* Live Mode Start Confirmation Dialog */}
+      <AlertDialog open={showStartConfirm} onOpenChange={setShowStartConfirm}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-destructive">⚠️ Start Bot in LIVE Mode?</AlertDialogTitle>
+            <AlertDialogDescription className="space-y-2">
+              <p>
+                This will start the trading bot in <strong className="text-destructive">LIVE mode</strong>. 
+                All trades will be executed with real money on connected exchanges.
+              </p>
+              <p className="text-destructive font-medium">
+                Real funds are at risk. Ensure your risk settings are configured properly.
+              </p>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction 
+              onClick={handleStartBot}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              Start LIVE Trading
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </TooltipProvider>
+  );
+}
