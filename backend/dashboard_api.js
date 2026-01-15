@@ -134,40 +134,132 @@ app.get('/api/system/status', async (req, res) => {
     }
     console.log('[API] Bot status:', botRunning ? 'running' : 'stopped');
 
-    // Get exchange connections
-    console.log('[API] ========================================');
-    console.log('[API] Fetching exchange connections from Supabase...');
-    console.log('[API] ========================================');
+    // 2. SSOT for balances: balance_history table (latest snapshot)
+    console.log('[API] Fetching FRESH balances from balance_history (SSOT)...');
+    const { data: latestBalanceSnapshot, error: balanceError } = await supabase
+      .from('balance_history')
+      .select('exchange_breakdown, total_balance, snapshot_time')
+      .order('snapshot_time', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    let exchangeBalances = new Map();
+    let totalBalance = 0;
     
-    // FIX: Discover actual column names by querying ALL rows first (more reliable)
-    let exchanges = [];
-    let availableColumns = [];
-    
-    // Step 1: Try to query all rows with * to discover column names AND get data
-    console.log('[API] Step 1: Querying exchange_connections with select(*)...');
-    const { data: allExchangesRaw, error: allRawError } = await supabase
-      .from('exchange_connections')
-      .select('*');
-    
-    console.log('[API] Query result - error:', allRawError ? JSON.stringify(allRawError) : 'none');
-    console.log('[API] Query result - data length:', allExchangesRaw ? allExchangesRaw.length : 0);
-    
-    if (allRawError) {
-      console.error('[API] ERROR: Querying all exchanges with * failed:', JSON.stringify(allRawError, null, 2));
-      // Try minimal query as fallback
-      const { data: minimalExchanges, error: minimalError } = await supabase
-        .from('exchange_connections')
-        .select('exchange_name, is_connected, is_active');
+    if (balanceError) {
+      console.error('[API] Error fetching balance_history:', balanceError);
+    } else if (latestBalanceSnapshot) {
+      console.log('[API] Balance snapshot time:', latestBalanceSnapshot.snapshot_time);
+      totalBalance = latestBalanceSnapshot.total_balance || 0;
       
-      if (minimalError) {
-        console.error('[API] Error with minimal query:', minimalError);
-        exchanges = [];
-        availableColumns = [];
-      } else {
-        exchanges = minimalExchanges || [];
-        availableColumns = ['exchange_name', 'is_connected', 'is_active'];
+      const breakdown = latestBalanceSnapshot.exchange_breakdown || [];
+      breakdown.forEach(item => {
+        if (item && item.exchange && item.balance !== undefined) {
+          const exchangeName = String(item.exchange).toLowerCase().trim();
+          exchangeBalances.set(exchangeName, Number(item.balance));
+        }
+      });
+      console.log('[API] Balances loaded:', Array.from(exchangeBalances.entries()));
+    }
+
+    // 3. Get connected exchanges from exchange_connections
+    console.log('[API] Fetching active exchanges...');
+    const { data: exchanges, error: exchangesError } = await supabase
+      .from('exchange_connections')
+      .select('exchange_name, is_connected, is_active')
+      .eq('is_active', true);
+
+    if (exchangesError) {
+      console.error('[API] Error fetching exchanges:', exchangesError);
+    }
+
+    const activeExchanges = exchanges || [];
+    console.log('[API] Active exchanges:', activeExchanges.length);
+
+    // 4. Get latest latency samples
+    console.log('[API] Fetching latency data...');
+    const { data: latencyData, error: latencyError } = await supabase
+      .from('latency_logs')
+      .select('venue, latency_ms, ts')
+      .order('ts', { ascending: false })
+      .limit(20);
+
+    if (latencyError) {
+      console.error('[API] Error fetching latency:', latencyError);
+    }
+
+    const latencySamples = latencyData || [];
+    
+    // Create latency map (latest per venue)
+    const latencyMap = new Map();
+    latencySamples.forEach(l => {
+      const venue = l.venue?.toLowerCase();
+      if (venue && !latencyMap.has(venue)) {
+        latencyMap.set(venue, l.latency_ms);
       }
-    } else if (allExchangesRaw && allExchangesRaw.length > 0) {
+    });
+
+    // 5. Build exchange list with balance and latency
+    const exchangeList = activeExchanges.map(ex => {
+      const exchangeName = ex.exchange_name?.toLowerCase() || '';
+      const balance = exchangeBalances.get(exchangeName) || 0;
+      const latency = latencyMap.get(exchangeName) || null;
+      
+      return {
+        name: ex.exchange_name,
+        balance,
+        latency
+      };
+    });
+
+    // 6. Get recent trades count
+    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const { count: tradesCount } = await supabase
+      .from('trade_logs')
+      .select('id', { count: 'exact', head: true })
+      .gte('entry_time', yesterday);
+
+    // 7. Build response
+    const response = {
+      bot: {
+        running: botRunning,
+        status: botRunning ? 'running' : 'stopped'
+      },
+      exchanges: {
+        connected: activeExchanges.length,
+        total: activeExchanges.length,
+        list: exchangeList
+      },
+      latency: {
+        recent: latencySamples.length,
+        samples: latencySamples.slice(0, 10).map(l => ({
+          venue: l.venue,
+          ms: l.latency_ms,
+          ts: l.ts
+        }))
+      },
+      trades: {
+        last24h: tradesCount || 0
+      },
+      vps: {
+        online: botRunning && latencySamples.length > 0,
+        status: botRunning ? 'active' : 'inactive'
+      },
+      timestamp: new Date().toISOString(),
+      responseTime: Date.now() - startTime
+    };
+
+    console.log('[API] Response summary:', {
+      botRunning: response.bot.running,
+      exchangesConnected: response.exchanges.connected,
+      totalBalance,
+      latencySamples: response.latency.recent,
+      trades24h: response.trades.last24h,
+      responseTime: response.responseTime
+    });
+    console.log('[API] ========================================');
+
+    res.json(response);
       // Successfully got data with * - use the first row to discover columns
       console.log('[API] ✓ Successfully queried with select(*)');
       const firstRow = allExchangesRaw[0];
