@@ -260,7 +260,6 @@ app.get('/api/system/status', async (req, res) => {
     console.log('[API] ========================================');
 
     res.json(response);
-      // Successfully got data with * - use the first row to discover columns
       console.log('[API] ✓ Successfully queried with select(*)');
       const firstRow = allExchangesRaw[0];
       availableColumns = Object.keys(firstRow);
