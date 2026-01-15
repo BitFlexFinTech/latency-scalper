@@ -63,11 +63,9 @@ export function DashboardLayout() {
   const [showKillSwitch, setShowKillSwitch] = useState(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [unreadCount, setUnreadCount] = useState(0);
-  const [botStatus, setBotStatus] = useState<{ is_running: boolean; last_heartbeat: string | null } | null>(null);
-  const [vpsLatency, setVpsLatency] = useState<number | null>(null);
-  const [vpsIp, setVpsIp] = useState<string | null>(null);
-  const [apiOnline, setApiOnline] = useState<boolean>(false);
-  const { vps } = useSystemStatus();
+  
+  // CRITICAL FIX: Use system status hook (reads from global store)
+  const systemStatus = useSystemStatus();
 
   // Fetch unread notification count
   useEffect(() => {
@@ -95,57 +93,8 @@ export function DashboardLayout() {
     return () => { supabase.removeChannel(channel); };
   }, []);
 
-  // CRITICAL FIX: Fetch bot status and VPS info from BACKEND API (SSOT)
-  useEffect(() => {
-    const fetchAllStatus = async () => {
-      try {
-        // SSOT FIX: Get comprehensive status from backend API
-        const systemStatus = await getSystemStatus();
-        
-        // Set bot status from backend API
-        setBotStatus({
-          is_running: systemStatus.bot.running,
-          last_heartbeat: null // Backend API doesn't provide this
-        });
-        
-        // Get VPS IP from backend API or fallback
-        if (vps.ip) {
-          setVpsIp(vps.ip);
-        } else {
-          // Fallback: Try to get from deployment table (only if backend doesn't provide)
-          try {
-            const { data: deployment } = await supabase
-              .from('hft_deployments')
-              .select('ip_address')
-              .in('status', ['active', 'running'])
-              .limit(1)
-              .maybeSingle();
-            
-            if (deployment?.ip_address) {
-              setVpsIp(deployment.ip_address);
-            } else {
-              setVpsIp('107.191.61.107'); // Known VPS IP
-            }
-          } catch {
-            setVpsIp('107.191.61.107');
-          }
-        }
-        
-        // Get latency from backend API (already in systemStatus.latency.samples)
-        if (systemStatus.latency.samples && systemStatus.latency.samples.length > 0) {
-          const latencies = systemStatus.latency.samples
-            .map(s => s.ms)
-            .filter((ms): ms is number => ms !== null && ms !== undefined);
-          
-          if (latencies.length > 0) {
-            const avgLatency = latencies.reduce((sum, l) => sum + l, 0) / latencies.length;
-            setVpsLatency(Math.round(avgLatency));
-          }
-        }
-      } catch (error) {
-        console.error('[DashboardLayout] Error fetching status from backend API:', error);
-        // Fallback: Set safe defaults
-        setBotStatus({ is_running: false, last_heartbeat: null });
+  // CRITICAL FIX: All status data now comes from useSystemStatus hook (reads from store)
+  // No need for separate API calls or state management
         setVpsIp(vps.ip || '107.191.61.107');
       }
     };
