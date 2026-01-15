@@ -86,12 +86,12 @@ export function useSystemStatus(): SystemStatus {
   
   return {
     // Bot Status
-    botRunning: store.systemStatus?.bot.running || false,
+    botRunning: store.getBotStatus(),
     botStatus: store.systemStatus?.bot.status || 'stopped',
     
     // Exchange Data
-    totalEquity: store.totalEquity,
-    connectedExchanges: store.connectedExchanges.length,
+    totalEquity: store.getTotalEquity(),
+    connectedExchanges: store.getConnectedExchangeCount(),
     exchangesList: store.connectedExchanges,
     
     // Performance
