@@ -182,6 +182,7 @@ app.get('/api/system/status', async (req, res) => {
     }
     
     // 4. Fallback: If exchange_connections doesn't have balances, use balance_history
+    // BUT: Check snapshot age - if older than 1 hour, warn that data is stale
     if (!balancesFromConnections) {
       console.log('[API] exchange_connections has no balance columns, falling back to balance_history...');
       const { data: latestBalanceSnapshot, error: balanceError } = await supabase
@@ -194,7 +195,17 @@ app.get('/api/system/status', async (req, res) => {
       if (balanceError) {
         console.error('[API] Error fetching balance_history:', balanceError);
       } else if (latestBalanceSnapshot && latestBalanceSnapshot.exchange_breakdown) {
+        const snapshotTime = new Date(latestBalanceSnapshot.snapshot_time);
+        const now = new Date();
+        const ageHours = (now - snapshotTime) / (1000 * 60 * 60);
+        
         console.log('[API] Balance snapshot time:', latestBalanceSnapshot.snapshot_time);
+        console.log('[API] Snapshot age:', ageHours.toFixed(2), 'hours');
+        
+        if (ageHours > 1) {
+          console.warn('[API] WARNING: balance_history snapshot is', ageHours.toFixed(2), 'hours old - data may be stale!');
+        }
+        
         const breakdown = Array.isArray(latestBalanceSnapshot.exchange_breakdown) 
           ? latestBalanceSnapshot.exchange_breakdown 
           : [];
@@ -205,11 +216,13 @@ app.get('/api/system/status', async (req, res) => {
             const balanceValue = Number(item.balance);
             if (!isNaN(balanceValue) && balanceValue >= 0) {
               exchangeBalances.set(exchangeName, balanceValue);
-              console.log(`[API] Balance from balance_history: ${exchangeName} = ${balanceValue}`);
+              console.log(`[API] Balance from balance_history: ${exchangeName} = ${balanceValue} (snapshot age: ${ageHours.toFixed(2)}h)`);
             }
           }
         });
         console.log('[API] Balances loaded from balance_history:', Array.from(exchangeBalances.entries()));
+      } else {
+        console.warn('[API] No balance_history data found - balances will be 0');
       }
     }
 
