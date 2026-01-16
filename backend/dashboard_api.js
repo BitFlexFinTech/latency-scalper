@@ -148,6 +148,14 @@ app.get('/api/system/status', async (req, res) => {
     const activeExchanges = exchangesRaw || [];
     console.log('[API] Active exchanges found:', activeExchanges.length);
 
+    // DIAGNOSTIC: Log all columns in exchange_connections to see what's available
+    if (activeExchanges.length > 0) {
+      const firstExchange = activeExchanges[0];
+      const allColumns = Object.keys(firstExchange);
+      console.log('[API] All columns in exchange_connections:', allColumns.join(', '));
+      console.log('[API] Sample exchange data:', JSON.stringify(firstExchange, null, 2));
+    }
+
     // 3. Try to get CURRENT balances from exchange_connections first
     let exchangeBalances = new Map();
     let balancesFromConnections = false;
@@ -163,6 +171,17 @@ app.get('/api/system/status', async (req, res) => {
           foundBalanceColumn = col;
           console.log('[API] Found balance column in exchange_connections:', col);
           break;
+        }
+      }
+      
+      // Also check for any column with "balance" in the name (case-insensitive)
+      if (!foundBalanceColumn) {
+        for (const col of Object.keys(firstExchange)) {
+          if (col.toLowerCase().includes('balance')) {
+            foundBalanceColumn = col;
+            console.log('[API] Found balance column (contains "balance"):', col, 'value:', firstExchange[col]);
+            break;
+          }
         }
       }
       
