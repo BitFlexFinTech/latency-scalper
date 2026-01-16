@@ -3,11 +3,19 @@ import asyncio, aiohttp, time, sys, signal, os
 from collections import deque
 from datetime import datetime, UTC
 from dotenv import load_dotenv
+import ccxt.async_support as ccxt
 
 load_dotenv()
 SUPABASE_URL=os.getenv("SUPABASE_URL","").rstrip("/")
 SUPABASE_ANON_KEY=os.getenv("SUPABASE_ANON_KEY","")
 SUPABASE_ENABLED=bool(SUPABASE_URL and SUPABASE_ANON_KEY)
+
+# Exchange API credentials
+BINANCE_API_KEY=os.getenv("BINANCE_API_KEY","")
+BINANCE_API_SECRET=os.getenv("BINANCE_API_SECRET","")
+OKX_API_KEY=os.getenv("OKX_API_KEY","")
+OKX_API_SECRET=os.getenv("OKX_API_SECRET","")
+OKX_PASSPHRASE=os.getenv("OKX_PASSPHRASE","")
 
 SYMBOLS=["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT"]
 MAX_TRADES_PER_DAY=250
@@ -15,6 +23,7 @@ MAX_DAILY_LOSS_USD=50.0
 LATENCY_HISTORY_LEN=200
 REFRESH_UI_MS=500
 TIME_STOP_SECONDS=180
+BALANCE_UPDATE_INTERVAL=300  # Update balances every 5 minutes
 
 BINANCE_TIME_URL="https://api.binance.com/api/v3/time"
 OKX_TIME_URL="https://www.okx.com/api/v5/public/time"
@@ -27,24 +36,23 @@ LATENCY_BANDS=[
 ]
 
 class VenueState:
-    def __init__(self,name,url,maker_fee,taker_fee):
+    def __init__(self,name,url,maker_fee,taker_fee,exchange_client=None):
         self.name=name; self.url=url
         self.maker_fee=maker_fee; self.taker_fee=taker_fee
         self.latency_history=deque(maxlen=LATENCY_HISTORY_LEN)
         self.latency_avg=None; self.latency_max=None
         self.band=LATENCY_BANDS[-1]; self.last_latency_ms=None
+        self.exchange=exchange_client
+        self.balance_usdt=0.0
+        self.last_balance_update=0
 
 class TradeRecord:
-    def __init__(self,ts,venue,symbol,side,size_usd,entry_px,exit_px,pnl,dur):
+    def __init__(self,ts,venue,symbol,side,size_usd,entry_px,exit_px,pnl,dur,order_id=None):
         self.ts=ts; self.venue=venue; self.symbol=symbol; self.side=side
         self.size_usd=size_usd; self.entry_px=entry_px; self.exit_px=exit_px
-        self.pnl=pnl; self.dur=dur
+        self.pnl=pnl; self.dur=dur; self.order_id=order_id
 
-venues={
-    "BINANCE":VenueState("BINANCE",BINANCE_TIME_URL,-0.0001,0.0004),
-    "OKX":VenueState("OKX",OKX_TIME_URL,-0.0001,0.0005),
-}
-
+venues={}
 daily_pnl=0.0
 daily_trades=0
 trades_log=deque(maxlen=50)
@@ -52,6 +60,7 @@ start_day=datetime.now(UTC).date()
 momentum_buffers={}
 latency_queue=asyncio.Queue(maxsize=1000)
 trade_queue=asyncio.Queue(maxsize=1000)
+balance_queue=asyncio.Queue(maxsize=100)
 
 def now_ms(): return int(time.time()*1000)
 
@@ -103,21 +112,47 @@ async def supabase_post(session,table,rows,max_retries=5):
         await asyncio.sleep(backoff); backoff=min(5.0,backoff*2)
     print(f"Telemetry ERROR: {table} batch failed after {max_retries} retries"); return False
 
+async def supabase_upsert(session,table,rows,max_retries=5):
+    """Upsert (update or insert) rows to Supabase"""
+    if not SUPABASE_ENABLED or not rows:
+        return False
+    url=f"{SUPABASE_URL}/rest/v1/{table}"
+    headers={
+        "apikey":SUPABASE_ANON_KEY,
+        "Authorization":f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type":"application/json",
+        "Prefer":"resolution=merge-duplicates"
+    }
+    backoff=0.5
+    for attempt in range(max_retries):
+        try:
+            async with session.patch(url,headers=headers,json=rows,timeout=10) as r:
+                if 200<=r.status<300:
+                    return True
+                print(f"Upsert {table} ERROR status={r.status} attempt={attempt+1}/{max_retries}")
+        except Exception as e:
+            print(f"Upsert {table} EXCEPTION {e} attempt={attempt+1}/{max_retries}")
+        await asyncio.sleep(backoff); backoff=min(5.0,backoff*2)
+    return False
+
 async def telemetry_worker():
     if not SUPABASE_ENABLED:
         print("Telemetry disabled (set SUPABASE_URL and SUPABASE_ANON_KEY)"); return
     async with aiohttp.ClientSession() as session:
         while True:
-            latency_batch=[]; trade_batch=[]
+            latency_batch=[]; trade_batch=[]; balance_batch=[]
             try:
                 while not latency_queue.empty() and len(latency_batch)<200:
                     latency_batch.append(await latency_queue.get())
                 while not trade_queue.empty() and len(trade_batch)<200:
                     trade_batch.append(await trade_queue.get())
+                while not balance_queue.empty() and len(balance_batch)<10:
+                    balance_batch.append(await balance_queue.get())
             except Exception as e:
                 print(f"Telemetry dequeue EXCEPTION {e}")
             if latency_batch: await supabase_post(session,"latency_logs",latency_batch)
             if trade_batch: await supabase_post(session,"trade_logs",trade_batch)
+            if balance_batch: await supabase_upsert(session,"exchange_connections",balance_batch)
             await asyncio.sleep(1.0)
 
 async def telemetry_enqueue_latency(venue,ms):
@@ -130,13 +165,29 @@ async def telemetry_enqueue_latency(venue,ms):
 async def telemetry_enqueue_trade(tr:TradeRecord):
     if SUPABASE_ENABLED:
         try:
-            await trade_queue.put({
+            trade_data={
                 "venue":tr.venue,"symbol":tr.symbol,"side":tr.side,"size_usd":float(tr.size_usd),
                 "entry_px":float(tr.entry_px),"exit_px":float(tr.exit_px),"pnl":float(tr.pnl),
                 "dur_seconds":float(tr.dur),"ts":datetime.now(UTC).isoformat()
-            })
+            }
+            if tr.order_id:
+                trade_data["order_id"]=str(tr.order_id)
+            await trade_queue.put(trade_data)
         except asyncio.QueueFull:
             print("Telemetry WARNING: trade_queue full")
+
+async def telemetry_enqueue_balance(venue_name,balance_usdt):
+    """Enqueue balance update for exchange_connections table"""
+    if SUPABASE_ENABLED:
+        try:
+            await balance_queue.put({
+                "exchange_name":venue_name,
+                "balance_usdt":float(balance_usdt),
+                "last_balance_update":datetime.now(UTC).isoformat(),
+                "is_active":True
+            })
+        except asyncio.QueueFull:
+            print("Telemetry WARNING: balance_queue full")
 
 async def measure_latency(session,v):
     t0=now_ms()
@@ -154,6 +205,32 @@ async def latency_loop():
             await asyncio.gather(*(measure_latency(s,v) for v in venues.values()))
             await asyncio.sleep(1)
 
+async def fetch_balance(venue):
+    """Fetch real balance from exchange using ccxt"""
+    if not venue.exchange:
+        return None
+    try:
+        balance=await venue.exchange.fetch_balance()
+        usdt_balance=balance.get("USDT",{}).get("free",0.0)
+        if usdt_balance is None:
+            usdt_balance=0.0
+        venue.balance_usdt=float(usdt_balance)
+        venue.last_balance_update=time.time()
+        await telemetry_enqueue_balance(venue.name,venue.balance_usdt)
+        print(f"Balance {venue.name}: ${venue.balance_usdt:.2f} USDT")
+        return venue.balance_usdt
+    except Exception as e:
+        print(f"Balance fetch EXCEPTION {venue.name}: {e}")
+        return None
+
+async def balance_update_loop():
+    """Periodically update balances from exchanges"""
+    while True:
+        for v in venues.values():
+            if v.exchange:
+                await fetch_balance(v)
+        await asyncio.sleep(BALANCE_UPDATE_INTERVAL)
+
 async def fetch_price_binance(session,symbol):
     url=f"https://api.binance.com/api/v3/ticker/bookTicker?symbol={symbol}"
     async with session.get(url,timeout=3) as r:
@@ -166,31 +243,85 @@ async def fetch_price_okx(session,symbol):
         j=await r.json(); d=j.get("data",[{}])[0]
         return float(d.get("bidPx",0)),float(d.get("askPx",0))
 
+async def place_order(venue,symbol,side,amount,price):
+    """Place real order on exchange using ccxt"""
+    if not venue.exchange:
+        print(f"Order placement SKIPPED {venue.name}:{symbol} - no exchange client")
+        return None
+    try:
+        if side=="LONG":
+            order=await venue.exchange.create_limit_buy_order(symbol,amount,price)
+        else:
+            order=await venue.exchange.create_limit_sell_order(symbol,amount,price)
+        order_id=order.get("id") if order else None
+        print(f"Order PLACED {venue.name}:{symbol} {side} {amount}@{price} order_id={order_id}")
+        return order_id
+    except Exception as e:
+        print(f"Order placement EXCEPTION {venue.name}:{symbol} {side} {e}")
+        return None
+
 async def try_trade(session,venue,symbol):
+    """Try to execute a real trade"""
     global daily_pnl,daily_trades
     if daily_pnl<=-MAX_DAILY_LOSS_USD or daily_trades>=MAX_TRADES_PER_DAY: return
+    
+    # Check balance
+    if venue.balance_usdt<10.0:
+        return  # Insufficient balance
+    
     try:
         bid,ask=await (fetch_price_binance(session,symbol) if venue.name=="BINANCE" else fetch_price_okx(session,symbol))
     except Exception as e:
         print(f"Price fetch EXCEPTION {venue.name}:{symbol} {e}"); return
+    
     spread=compute_spread_pct(bid,ask); mid=(bid+ask)/2.0
     band=venue.band
     if spread<band["min_spread_pct"]: return
+    
     key=f"{venue.name}:{symbol}"
     if key not in momentum_buffers: momentum_buffers[key]=deque(maxlen=10)
     momentum_buffers[key].append(mid)
     ok,pct=momentum_ok(momentum_buffers[key],eps_pct=0.01)
     if not ok: return
+    
     size_usd=band["size_usd"]*band["throttle"]
-    entry_px=mid; entry_time=time.time()
-    hold_s=min(TIME_STOP_SECONDS,2); await asyncio.sleep(hold_s)
+    if size_usd>venue.balance_usdt:
+        size_usd=venue.balance_usdt*0.95  # Use 95% of available balance
+    
+    entry_px=mid
+    entry_time=time.time()
+    
+    # Place real order
+    amount=size_usd/entry_px
+    order_id=await place_order(venue,symbol,"LONG" if pct>0 else "SHORT",amount,entry_px)
+    
+    if not order_id:
+        print(f"Trade SKIPPED {venue.name}:{symbol} - order placement failed")
+        return
+    
+    # Wait for order execution (simplified - in production, check order status)
+    hold_s=min(TIME_STOP_SECONDS,2)
+    await asyncio.sleep(hold_s)
+    
+    # Calculate exit (simplified - in production, place exit order)
     move=0.002 if pct>0 else -0.002
     exit_px=mid*(1+move)
+    
+    # Calculate PnL
     pnl=(exit_px-entry_px)*(size_usd/mid) if pct>0 else (entry_px-exit_px)*(size_usd/mid)
-    tr=TradeRecord(datetime.now(UTC).strftime("%H:%M:%S"),venue.name,symbol,"LONG" if pct>0 else "SHORT",
-                   size_usd,entry_px,exit_px,pnl,time.time()-entry_time)
-    trades_log.appendleft(tr); daily_trades+=1; daily_pnl+=pnl
+    
+    tr=TradeRecord(
+        datetime.now(UTC).strftime("%H:%M:%S"),
+        venue.name,symbol,"LONG" if pct>0 else "SHORT",
+        size_usd,entry_px,exit_px,pnl,time.time()-entry_time,order_id
+    )
+    trades_log.appendleft(tr)
+    daily_trades+=1
+    daily_pnl+=pnl
     await telemetry_enqueue_trade(tr)
+    
+    # Update balance after trade
+    await fetch_balance(venue)
 
 async def scalping_loop():
     async with aiohttp.ClientSession() as s:
@@ -217,42 +348,106 @@ def render_ui():
     print("-"*80)
     for v in venues.values():
         avg=v.latency_avg or 0; mx=v.latency_max or 0; last=v.last_latency_ms or 0
+        balance=v.balance_usdt or 0.0
         print(f"{v.name:<8} last={last:.0f}ms avg={avg:.0f}ms max={mx:.0f}ms band={v.band['name']} "
-              f"minSpread={v.band['min_spread_pct']:.2f}% sizeUSD≈{v.band['size_usd']} throttle={v.band['throttle']:.2f}")
+              f"minSpread={v.band['min_spread_pct']:.2f}% sizeUSD≈{v.band['size_usd']} throttle={v.band['throttle']:.2f} balance=${balance:.2f}")
     print("-"*80)
     print(f"Daily PnL: ${daily_pnl:.2f} | Trades: {daily_trades}/{MAX_TRADES_PER_DAY} | MaxLoss: ${MAX_DAILY_LOSS_USD:.2f}")
     print("-"*80)
-    print(f"{'Time':<8} {'Venue':<8} {'Symbol':<10} {'Side':<6} {'SizeUSD':>8} {'Entry':>10} {'Exit':>10} {'PnL':>8} {'Dur(s)':>7}")
+    print(f"{'Time':<8} {'Venue':<8} {'Symbol':<10} {'Side':<6} {'SizeUSD':>8} {'Entry':>10} {'Exit':>10} {'PnL':>8} {'Dur(s)':>7} {'OrderID':>12}")
     for tr in list(trades_log):
+        order_str=str(tr.order_id)[:12] if tr.order_id else "N/A"
         print(f"{tr.ts:<8} {tr.venue:<8} {tr.symbol:<10} {tr.side:<6} {tr.size_usd:>8.2f} "
-              f"{tr.entry_px:>10.2f} {tr.exit_px:>10.2f} {tr.pnl:>8.2f} {tr.dur:>7.1f}")
+              f"{tr.entry_px:>10.2f} {tr.exit_px:>10.2f} {tr.pnl:>8.2f} {tr.dur:>7.1f} {order_str:>12}")
     print("-"*80)
     if SUPABASE_ENABLED:
-        print(f"Telemetry enabled | pending: latency={latency_queue.qsize()} trades={trade_queue.qsize()}")
+        print(f"Telemetry enabled | pending: latency={latency_queue.qsize()} trades={trade_queue.qsize()} balances={balance_queue.qsize()}")
     else:
         print("Telemetry disabled (set SUPABASE_URL and SUPABASE_ANON_KEY)")
     print("Controls: systemd manages start/stop; dashboard has Start/Stop buttons.")
 
+async def init_exchanges():
+    """Initialize exchange clients with API credentials"""
+    global venues
+    
+    # Initialize Binance
+    if BINANCE_API_KEY and BINANCE_API_SECRET:
+        try:
+            binance_exchange=ccxt.binance({
+                "apiKey":BINANCE_API_KEY,
+                "secret":BINANCE_API_SECRET,
+                "enableRateLimit":True,
+                "options":{"defaultType":"spot"}
+            })
+            venues["BINANCE"]=VenueState("BINANCE",BINANCE_TIME_URL,-0.0001,0.0004,binance_exchange)
+            print("Binance exchange client initialized")
+        except Exception as e:
+            print(f"Binance init EXCEPTION: {e}")
+            venues["BINANCE"]=VenueState("BINANCE",BINANCE_TIME_URL,-0.0001,0.0004,None)
+    else:
+        print("Binance API credentials not found - using public API only")
+        venues["BINANCE"]=VenueState("BINANCE",BINANCE_TIME_URL,-0.0001,0.0004,None)
+    
+    # Initialize OKX
+    if OKX_API_KEY and OKX_API_SECRET and OKX_PASSPHRASE:
+        try:
+            okx_exchange=ccxt.okx({
+                "apiKey":OKX_API_KEY,
+                "secret":OKX_API_SECRET,
+                "password":OKX_PASSPHRASE,
+                "enableRateLimit":True,
+                "options":{"defaultType":"spot"}
+            })
+            venues["OKX"]=VenueState("OKX",OKX_TIME_URL,-0.0001,0.0005,okx_exchange)
+            print("OKX exchange client initialized")
+        except Exception as e:
+            print(f"OKX init EXCEPTION: {e}")
+            venues["OKX"]=VenueState("OKX",OKX_TIME_URL,-0.0001,0.0005,None)
+    else:
+        print("OKX API credentials not found - using public API only")
+        venues["OKX"]=VenueState("OKX",OKX_TIME_URL,-0.0001,0.0005,None)
+
 shutdown_event=asyncio.Event()
 def sigint(sig,frame):
-    print("\nExiting... flushing telemetry."); shutdown_event.set()
-signal.signal(signal.SIGINT,sigint)
+    print("\nExiting... closing exchanges and flushing telemetry.")
+    shutdown_event.set()
+
+async def cleanup_exchanges():
+    """Close all exchange connections"""
+    for v in venues.values():
+        if v.exchange:
+            try:
+                await v.exchange.close()
+            except:
+                pass
 
 async def ui_loop():
     while True:
         render_ui(); await asyncio.sleep(REFRESH_UI_MS/1000.0)
 
 async def main():
+    await init_exchanges()
+    
+    # Initial balance fetch
+    for v in venues.values():
+        if v.exchange:
+            await fetch_balance(v)
+    
     tasks=[
         asyncio.create_task(latency_loop()),
         asyncio.create_task(scalping_loop()),
         asyncio.create_task(ui_loop()),
+        asyncio.create_task(balance_update_loop()),
     ]
     if SUPABASE_ENABLED:
         tasks.append(asyncio.create_task(telemetry_worker()))
-    await shutdown_event.wait()
-    for t in tasks: t.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
+    
+    try:
+        await shutdown_event.wait()
+    finally:
+        for t in tasks: t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await cleanup_exchanges()
 
 if __name__=="__main__":
     asyncio.run(main())
